@@ -1,9 +1,10 @@
-name: CodeQL and Unit Test
+
+name: CodeQL and Test
 
 on:
   pull_request:
     branches: [ master ]
-  workflow_dispatch:  # allow manual trigger
+  workflow_dispatch:
 
 jobs:
   analyze:
@@ -31,10 +32,10 @@ jobs:
         uses: github/codeql-action/autobuild@v3
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3 
+        uses: github/codeql-action/analyze@v3
 
   test:
-    name: Unit Test
+    name: Setup RSpace & Run Tests
     runs-on: ubuntu-latest
     needs: analyze
 
@@ -42,13 +43,81 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
+      - name: Clone rspace-docker repo
+        run: git clone --branch main https://github.com/rspace-os/rspace-docker
+
+      - name: Download latest rspace.war
+        working-directory: rspace-docker
+        run: |
+          chmod +x ../rspace_war.sh
+          ../rspace_war.sh
+
+      - name: Update deployment.properties
+        working-directory: rspace-docker
+        run: echo "sysadmin.apikey.generation=true" >> deployment.properties
+
+      - name: Run Docker Info
+        run: docker info
+
+      - name: Start Docker Compose
+        working-directory: rspace-docker
+        run: docker compose up -d
+
+      - name: Wait for Database Health
+        working-directory: rspace-docker
+        run: |
+          max_attempts=30
+          attempt=0
+          while ! docker inspect --format "{{json .State.Health.Status }}" rspace-db | grep -q "healthy"; do
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "Database did not become healthy after $max_attempts attempts."
+              docker logs rspace-db
+              exit 1
+            fi
+            echo "Waiting for database to be healthy... Attempt $((attempt+1))"
+            attempt=$((attempt+1))
+            sleep 5
+          done
+          echo "Database is healthy!"
+
+      - name: wait for rspace UI
+        run: |
+          for i in {1..60}; do
+             if curl -sf http://localhost:8080/login  > /dev/null; then
+              echo "RSpace UI is ready"
+              exit 0
+            fi
+            echo "Waiting for RSpace UI... ($i)"
+            sleep 5
+          done
+          echo "RSpace UI did not start in time"
+          docker logs rspace-app | tail -n 500
+          exit 1
       - name: Set up Poetry
         run: |
           curl -sSL https://install.python-poetry.org | python3 -
-          echo 'export PATH="$HOME/.local/bin:$PATH"' >> $GITHUB_ENV
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Install dependencies
         run: poetry install
+        
+      - name: Install Playwright Browsers
+        run: poetry run python -m playwright install chromium --with-deps
+      
+      - name: Generate RSpace API Key
+        id: generate_key
+        run: |
+          poetry run python get_rspace_api_key.py
+          api_key=$(cat api_key.txt)
+          echo "::add-mask::$api_key"
+          echo "RSPACE_API_KEY=$api_key" >> $GITHUB_ENV
+        env:
+          RSPACE_URL: "http://localhost:8080"
+          RSPACE_USERNAME: ${{ secrets.RSPACE_USERNAME }}
+          RSPACE_PASSWORD: ${{ secrets.RSPACE_PASSWORD }}
 
-      - name: Run Unit Test
+      - name: Run Tests (unit + integration)
+        env:
+          RSPACE_URL: "http://localhost:8080"
+          RSPACE_API_KEY: ${{ env.RSPACE_API_KEY }}
         run: poetry run pytest rspace_client/tests
